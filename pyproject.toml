@@ -1,0 +1,20 @@
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+[project]
+name = "haberlea-kkbox"
+version = "0.1.0"
+description = "KKBOX module for Haberlea"
+requires-python = ">=3.11"
+dependencies = [
+    "aiofiles>=25.1.0",
+    "msgspec>=0.20.0",
+    "mutagen>=1.47.0",
+    "pycryptodomex>=3.23.0",
+    "rich>=14.2.0",
+    "tenacity>=9.0.0",
+]
+
+[project.entry-points."haberlea.modules"]
+kkbox = "haberlea_kkbox:module_information"
