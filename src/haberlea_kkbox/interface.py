@@ -34,7 +34,6 @@ from haberlea.utils.models import (
     TrackDownloadInfo,
     TrackInfo,
 )
-from haberlea.utils.tempfile_manager import TempFileManager
 
 from .kkbox_api import KkboxAPI
 
@@ -242,12 +241,9 @@ class ModuleInterface(ModuleBase):
             # Restore session from saved data if available
             self.api.restore_session()
 
-        self.temp_manager = TempFileManager()
-
     async def close(self) -> None:
         """Close the module and release resources."""
         await self.api.close()
-        await self.temp_manager.cleanup()
 
     def custom_url_parse(self, url: str) -> MediaIdentification | None:
         """Parse a KKBOX URL to extract media type and ID.

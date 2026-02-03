@@ -4,15 +4,16 @@ This module provides an async KKBOX API client using aiohttp,
 handling authentication, content retrieval, and DRM decryption.
 """
 
-import asyncio
 import logging
-import os
 import re
+from collections.abc import Callable
 from random import randrange
 from time import time
 from typing import Any
 
+import anyio
 import msgspec
+from anyio.to_thread import run_sync
 from Cryptodome.Cipher import ARC4
 from Cryptodome.Hash import MD5
 from mutagen.flac import FLAC
@@ -609,7 +610,7 @@ class KkboxAPI:
             raise TicketRetryableError("Device unauthorized, authorized and retrying")
         elif status == 2:
             # Rate limiting, wait before retry
-            await asyncio.sleep(0.5)
+            await anyio.sleep(0.5)
             raise TicketRetryableError("Rate limited, retrying after delay")
         elif status != 1:
             raise ModuleAPIError(
@@ -648,19 +649,25 @@ class KkboxAPI:
                 module_name="kkbox",
             ) from e
 
-    async def download_kkdrm(
-        self,
-        url: str,
-        target_path: str,
-    ) -> None:
-        """Download and decrypt a KKDRM protected file.
+    def _create_kkdrm_decryptor(self) -> Callable[[bytes, int], bytes]:
+        """Create a chunk processor for KKDRM RC4 decryption.
 
-        Downloads the encrypted file using download_file for progress reporting,
-        then decrypts it in place.
+        KKDRM format: skip first 1024 bytes, then RC4 decrypt the rest.
 
-        Args:
-            url: URL of the encrypted file.
-            target_path: Path to save the decrypted file.
+        IMPORTANT: The returned processor captures mutable state (bytes_seen
+        and RC4 cipher internal state). Chunks MUST be processed sequentially
+        in order. Parallel or out-of-order processing will produce incorrect
+        decryption results.
+
+        Returns:
+            A chunk processor function for use with download_file.
+            The processor signature matches download_file's chunk_processor
+            interface: (chunk: bytes, chunk_index: int) -> bytes.
+            Note: chunk_index is not used by this processor as it relies
+            on sequential byte counting instead.
+
+        Raises:
+            ModuleAPIError: If not authenticated (no license key).
         """
         if self.lic_content_key is None:
             raise ModuleAPIError(
@@ -670,60 +677,63 @@ class KkboxAPI:
                 module_name="kkbox",
             )
 
-        # Download encrypted file with progress reporting
-        temp_path = target_path + ".kkdrm"
-        try:
-            await download_file(url, temp_path, session=self.session)
+        # RC4 cipher with 512-byte drop
+        rc4 = ARC4.new(self.lic_content_key, drop=512)
+        skip = 1024
+        bytes_seen = 0
 
-            # Decrypt in thread pool (read, decrypt, write)
-            await asyncio.to_thread(self._decrypt_kkdrm_file, temp_path, target_path)
-        finally:
-            # Always remove temp file if it exists
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+        def process_chunk(chunk: bytes, _chunk_index: int) -> bytes:
+            """Process a single chunk with sequential decryption.
+
+            Args:
+                chunk: Raw encrypted chunk data.
+                _chunk_index: Chunk index (unused, required by interface).
+
+            Returns:
+                Decrypted chunk data, or empty bytes if in skip region.
+            """
+            nonlocal bytes_seen
+            start = bytes_seen
+            bytes_seen += len(chunk)
+
+            # Case 1: Chunk entirely in skip region
+            if start + len(chunk) <= skip:
+                return b""
+            # Case 2: Chunk spans the skip boundary
+            elif start < skip:
+                skip_count = skip - start
+                return rc4.decrypt(chunk[skip_count:])
+            # Case 3: Chunk entirely after skip region
+            else:
+                return rc4.decrypt(chunk)
+
+        return process_chunk
+
+    async def download_kkdrm(
+        self,
+        url: str,
+        target_path: str,
+    ) -> None:
+        """Download and decrypt a KKDRM protected file with streaming decryption.
+
+        Decrypts during download: skips first 1024 bytes, then RC4 decrypts.
+
+        Args:
+            url: URL of the encrypted file.
+            target_path: Path to save the decrypted file.
+        """
+        chunk_processor = self._create_kkdrm_decryptor()
+
+        await download_file(
+            url,
+            target_path,
+            session=self.session,
+            chunk_processor=chunk_processor,
+        )
 
         # Clean FLAC metadata if applicable
         if target_path.lower().endswith(".flac"):
-            await asyncio.to_thread(self._clean_flac_metadata, target_path)
-
-    def _decrypt_kkdrm_file(self, input_path: str, output_path: str) -> None:
-        """Decrypt a KKDRM file.
-
-        Args:
-            input_path: Path to encrypted file.
-            output_path: Path to save decrypted file.
-        """
-        if self.lic_content_key is None:
-            raise ValueError("License content key is not set")
-
-        with open(input_path, "rb") as f_in:
-            # Skip first 1024 bytes
-            f_in.seek(1024)
-            encrypted_data = f_in.read()
-
-        rc4 = ARC4.new(self.lic_content_key, drop=512)
-        decrypted_data = rc4.decrypt(encrypted_data)
-
-        with open(output_path, "wb") as f_out:
-            f_out.write(decrypted_data)
-
-    def _decrypt_kkdrm(self, encrypted_data: bytes) -> bytes:
-        """Decrypt KKDRM data.
-
-        Args:
-            encrypted_data: The encrypted bytes to decrypt (already skipped 1024).
-
-        Returns:
-            Decrypted bytes.
-
-        Note:
-            This method is kept for backward compatibility.
-        """
-        if self.lic_content_key is None:
-            raise ValueError("License content key is not set")
-
-        rc4 = ARC4.new(self.lic_content_key, drop=512)
-        return rc4.decrypt(encrypted_data)
+            await run_sync(self._clean_flac_metadata, target_path)
 
     def _clean_flac_metadata(self, file_path: str) -> None:
         """Remove all metadata tags from a FLAC file.
