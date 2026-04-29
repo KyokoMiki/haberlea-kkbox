@@ -4,11 +4,11 @@ This module implements the ModuleBase interface for the KKBOX music service,
 providing async methods for authentication, metadata retrieval, and downloading.
 """
 
+import logging
 import re
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-
-from rich import print
 
 from haberlea.plugins.base import ModuleBase
 from haberlea.utils.models import (
@@ -37,12 +37,16 @@ from haberlea.utils.models import (
 
 from .kkbox_api import KkboxAPI
 
+logger = logging.getLogger(__name__)
+
 module_information = ModuleInformation(
     service_name="KKBOX",
     module_supported_modes=(
         ModuleModes.download | ModuleModes.lyrics | ModuleModes.covers
     ),
     global_settings={
+        "name": "",
+        "region": "",
         "kc1_key": "7f1a68f00b747f4ac1469c72e7ef492c",
         "secret_key": "0ff29b7c9bd8fb60a3abd6b3d402b02c",
     },
@@ -199,9 +203,6 @@ class ModuleInterface(ModuleBase):
         tsc = module_controller.temporary_settings_controller
 
         self.default_cover = module_controller.haberlea_options.default_cover_options
-        self.check_sub = (
-            not module_controller.haberlea_options.disable_subscription_check
-        )
 
         # KKBOX doesn't support webp covers -
         # create a copy to avoid mutating shared options
@@ -291,10 +292,10 @@ class ModuleInterface(ModuleBase):
         """
         await self.api.login(email, password)
 
-        if self.check_sub and self.current_quality not in self.api.available_qualities:
-            print(
-                "KKBOX: quality set in settings is not accessible "
-                "by the current subscription"
+        if self.current_quality not in self.api.available_qualities:
+            logger.warning(
+                "KKBOX: quality set in settings is not accessible"
+                " by the current subscription"
             )
 
     async def get_track_info(
@@ -425,7 +426,7 @@ class ModuleInterface(ModuleBase):
 
     async def get_track_download(
         self,
-        target_path: str,
+        target_path: Path,
         url: str = "",
         data: dict[str, Any] | None = None,
     ) -> TrackDownloadInfo:

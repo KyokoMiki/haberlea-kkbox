@@ -6,7 +6,7 @@ handling authentication, content retrieval, and DRM decryption.
 
 import logging
 import re
-from collections.abc import Callable
+from pathlib import Path
 from random import randrange
 from time import time
 from typing import Any
@@ -27,7 +27,7 @@ from tenacity import (
 
 from haberlea.utils.exceptions import ModuleAPIError, ModuleAuthError, ModuleError
 from haberlea.utils.models import TemporarySettingsController
-from haberlea.utils.utils import create_aiohttp_session, download_file
+from haberlea.utils.utils import DownloadConfig, create_aiohttp_session, download_file
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,45 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 5
 
 
-class TicketRetryableError(ModuleError):
-    """Exception to signal that ticket request should be retried."""
+class SessionRetryableError(ModuleError):
+    """Signal that a request should be retried after session/auth recovery."""
+
+
+class KkdrmDecryptor:
+    """Stateful DRM decryptor — mutable by necessity (streaming cipher).
+
+    KKDRM format: skip first 1024 bytes, then RC4 decrypt the rest.
+    Chunks MUST be processed sequentially in order.
+    """
+
+    def __init__(self, key: bytes) -> None:
+        self._rc4 = ARC4.new(key, drop=512)
+        self._bytes_seen: int = 0
+        self._skip: int = 1024
+
+    def __call__(self, chunk: bytes, _chunk_index: int) -> bytes:
+        """Process a single chunk with sequential decryption.
+
+        Args:
+            chunk: Raw encrypted chunk data.
+            _chunk_index: Chunk index (unused, required by interface).
+
+        Returns:
+            Decrypted chunk data, or empty bytes if in skip region.
+        """
+        start = self._bytes_seen
+        self._bytes_seen += len(chunk)
+
+        # Case 1: Chunk entirely in skip region
+        if start + len(chunk) <= self._skip:
+            return b""
+        # Case 2: Chunk spans the skip boundary
+        elif start < self._skip:
+            skip_count = self._skip - start
+            return self._rc4.decrypt(chunk[skip_count:])
+        # Case 3: Chunk entirely after skip region
+        else:
+            return self._rc4.decrypt(chunk)
 
 
 class KkboxAPI:
@@ -230,9 +267,20 @@ class KkboxAPI:
                 - sid: Session ID
                 - lic_content_key: License content key for DRM decryption
                 - high_quality: Optional flag for hi-fi access
+
+        Note:
+            ``lic_content_key`` may be absent from renewal responses
+            (e.g. ``check.php``); in that case the previously applied
+            key is retained.
         """
         self.sid = resp["sid"]
-        self.lic_content_key = resp["lic_content_key"].encode("ascii")
+        key = resp.get("lic_content_key")
+        if key:
+            self.lic_content_key = key.encode("ascii")
+        elif self.lic_content_key is None:
+            logger.warning(
+                "Session response missing lic_content_key and no prior key available"
+            )
         self.available_qualities = ["128k", "192k", "320k"]
         if resp.get("high_quality"):
             self.available_qualities.extend(["hifi", "hires"])
@@ -443,6 +491,12 @@ class KkboxAPI:
             )
         return resp["data"]
 
+    @retry(
+        retry=retry_if_exception_type(SessionRetryableError),
+        stop=stop_after_attempt(MAX_RETRIES),
+        wait=wait_fixed(0),
+        reraise=True,
+    )
     async def get_album_more(self, raw_id: int) -> dict[str, Any]:
         """Get detailed album metadata by raw ID.
 
@@ -451,9 +505,21 @@ class KkboxAPI:
 
         Returns:
             Detailed album data dictionary.
+
+        Raises:
+            SessionRetryableError: When retry is needed.
+            ModuleAPIError: When request fails permanently.
         """
         resp = await self._api_call("ds", "album_more.php", params={"album": raw_id})
-        return resp or {}
+        if not resp:
+            raise ModuleAPIError(
+                error_code=500,
+                error_message="Empty album_more response",
+                api_endpoint="album_more.php",
+                module_name="kkbox",
+            )
+        await self._handle_status_errors(resp, api_endpoint="album_more.php")
+        return resp
 
     async def get_artist(self, artist_id: str) -> dict[str, Any]:
         """Get artist metadata.
@@ -554,8 +620,48 @@ class KkboxAPI:
         )
         return resp or {}
 
+    async def _handle_status_errors(
+        self,
+        resp: dict[str, Any],
+        *,
+        api_endpoint: str,
+        fail_message: str = "Request failed",
+        fail_error_code: int = 403,
+    ) -> None:
+        """Handle common KKBOX status codes with session/auth recovery.
+
+        Args:
+            resp: API response dictionary containing a ``status`` field.
+            api_endpoint: Endpoint name for error reporting.
+            fail_message: Message to use when status indicates permanent failure.
+            fail_error_code: Error code to use when status indicates permanent failure.
+
+        Raises:
+            SessionRetryableError: When the caller should retry after recovery.
+            ModuleAPIError: When the request failed permanently.
+        """
+        status = resp.get("status")
+        if status == 1 or status is None:
+            return
+        if status == -1:
+            await self.renew_session()
+            raise SessionRetryableError("Session expired, renewed and retrying")
+        if status == -4:
+            await self.auth_device()
+            raise SessionRetryableError("Device unauthorized, authorized and retrying")
+        if status == 2:
+            # Rate limiting, wait before retry
+            await anyio.sleep(0.5)
+            raise SessionRetryableError("Rate limited, retrying after delay")
+        raise ModuleAPIError(
+            error_code=fail_error_code,
+            error_message=fail_message,
+            api_endpoint=api_endpoint,
+            module_name="kkbox",
+        )
+
     @retry(
-        retry=retry_if_exception_type(TicketRetryableError),
+        retry=retry_if_exception_type(SessionRetryableError),
         stop=stop_after_attempt(MAX_RETRIES),
         wait=wait_fixed(0),
         reraise=True,
@@ -573,7 +679,7 @@ class KkboxAPI:
             Response dictionary from ticket API.
 
         Raises:
-            TicketRetryableError: When retry is needed.
+            SessionRetryableError: When retry is needed.
             ModuleAPIError: When request fails permanently.
         """
         resp = await self._api_call(
@@ -601,25 +707,11 @@ class KkboxAPI:
                 module_name="kkbox",
             )
 
-        status = resp.get("status")
-        if status == -1:
-            await self.renew_session()
-            raise TicketRetryableError("Session expired, renewed and retrying")
-        elif status == -4:
-            await self.auth_device()
-            raise TicketRetryableError("Device unauthorized, authorized and retrying")
-        elif status == 2:
-            # Rate limiting, wait before retry
-            await anyio.sleep(0.5)
-            raise TicketRetryableError("Rate limited, retrying after delay")
-        elif status != 1:
-            raise ModuleAPIError(
-                error_code=403,
-                error_message="Couldn't get track URLs",
-                api_endpoint="v1/ticket",
-                module_name="kkbox",
-            )
-
+        await self._handle_status_errors(
+            resp,
+            api_endpoint="v1/ticket",
+            fail_message="Couldn't get track URLs",
+        )
         return resp
 
     async def get_ticket(
@@ -649,22 +741,11 @@ class KkboxAPI:
                 module_name="kkbox",
             ) from e
 
-    def _create_kkdrm_decryptor(self) -> Callable[[bytes, int], bytes]:
+    def _create_kkdrm_decryptor(self) -> KkdrmDecryptor:
         """Create a chunk processor for KKDRM RC4 decryption.
 
-        KKDRM format: skip first 1024 bytes, then RC4 decrypt the rest.
-
-        IMPORTANT: The returned processor captures mutable state (bytes_seen
-        and RC4 cipher internal state). Chunks MUST be processed sequentially
-        in order. Parallel or out-of-order processing will produce incorrect
-        decryption results.
-
         Returns:
-            A chunk processor function for use with download_file.
-            The processor signature matches download_file's chunk_processor
-            interface: (chunk: bytes, chunk_index: int) -> bytes.
-            Note: chunk_index is not used by this processor as it relies
-            on sequential byte counting instead.
+            KkdrmDecryptor instance for use with download_file.
 
         Raises:
             ModuleAPIError: If not authenticated (no license key).
@@ -676,43 +757,12 @@ class KkboxAPI:
                 api_endpoint="download",
                 module_name="kkbox",
             )
-
-        # RC4 cipher with 512-byte drop
-        rc4 = ARC4.new(self.lic_content_key, drop=512)
-        skip = 1024
-        bytes_seen = 0
-
-        def process_chunk(chunk: bytes, _chunk_index: int) -> bytes:
-            """Process a single chunk with sequential decryption.
-
-            Args:
-                chunk: Raw encrypted chunk data.
-                _chunk_index: Chunk index (unused, required by interface).
-
-            Returns:
-                Decrypted chunk data, or empty bytes if in skip region.
-            """
-            nonlocal bytes_seen
-            start = bytes_seen
-            bytes_seen += len(chunk)
-
-            # Case 1: Chunk entirely in skip region
-            if start + len(chunk) <= skip:
-                return b""
-            # Case 2: Chunk spans the skip boundary
-            elif start < skip:
-                skip_count = skip - start
-                return rc4.decrypt(chunk[skip_count:])
-            # Case 3: Chunk entirely after skip region
-            else:
-                return rc4.decrypt(chunk)
-
-        return process_chunk
+        return KkdrmDecryptor(self.lic_content_key)
 
     async def download_kkdrm(
         self,
         url: str,
-        target_path: str,
+        target_path: Path,
     ) -> None:
         """Download and decrypt a KKDRM protected file with streaming decryption.
 
@@ -727,22 +777,22 @@ class KkboxAPI:
         await download_file(
             url,
             target_path,
+            config=DownloadConfig(chunk_processor=chunk_processor),
             session=self.session,
-            chunk_processor=chunk_processor,
         )
 
         # Clean FLAC metadata if applicable
-        if target_path.lower().endswith(".flac"):
+        if target_path.suffix.lower() == ".flac":
             await run_sync(self._clean_flac_metadata, target_path)
 
-    def _clean_flac_metadata(self, file_path: str) -> None:
+    def _clean_flac_metadata(self, file_path: Path) -> None:
         """Remove all metadata tags from a FLAC file.
 
         Args:
             file_path: Path to the FLAC file.
         """
         try:
-            audio = FLAC(file_path)
+            audio = FLAC(str(file_path))
             audio.clear()
             audio.save()
         except Exception as e:
