@@ -4,6 +4,7 @@ This module provides an async KKBOX API client using aiohttp,
 handling authentication, content retrieval, and DRM decryption.
 """
 
+import base64
 import logging
 import re
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 import anyio
 import msgspec
+import rich
 from anyio.to_thread import run_sync
 from Cryptodome.Cipher import ARC4
 from Cryptodome.Hash import MD5
@@ -368,12 +370,80 @@ class KkboxAPI:
             raise ModuleAuthError(module_name="kkbox")
 
         status = resp.get("status")
+        if status == -4:
+            resp = await self._remote_login_fallback(email, pswd_hash)
+            status = resp.get("status")
+
         if status not in (2, 3):
             raise ModuleAuthError(module_name="kkbox")
 
         # Save minimal session data and apply
         self.tsc.set("login_response", self._extract_session_data(resp))
         self._apply_session(resp)
+
+    async def _remote_login_fallback(
+        self, email: str, pswd_hash: str
+    ) -> dict[str, Any]:
+        """Prompt user to perform login from a supported-region device.
+
+        When the local IP is blocked (status -4), generates a one-line Python
+        command that the user can run on a device in a supported region,
+        then pastes the base64-encoded raw response back. The response is
+        decoded and KC1-decrypted locally.
+
+        Args:
+            email: User email address.
+            pswd_hash: MD5-hashed password.
+
+        Returns:
+            Decoded login response dictionary.
+
+        Raises:
+            ModuleAuthError: If the response cannot be decoded.
+        """
+        script = f"""
+import time, hashlib, urllib.request, urllib.parse, base64
+t = str(int(time.time()))
+sec = hashlib.md5(
+    b'06120082' + t.encode() + b'{self.secret_key.decode("ascii")}'
+).hexdigest()
+url = 'https://api-login.kkbox.com.tw/login.php?' + urllib.parse.urlencode({{
+    'enc': 'u', 'ver': '06120082', 'os': 'android', 'osver': '13',
+    'lang': 'en', 'ui_lang': 'en', 'dist': '0021', 'dist2': '0021',
+    'resolution': '411x841', 'of': 'j', 'oenc': 'kc1', 'secret': sec, 'timestamp': t
+}})
+data = urllib.parse.urlencode({{
+    'uid': '{email}', 'passwd': '{pswd_hash}', 
+    'kkid': '{self.kkid}', 'registration_id': ''
+}}).encode()
+req = urllib.request.Request(url, data=data, headers={{'user-agent': 'okhttp/3.14.9'}})
+print(base64.b64encode(urllib.request.urlopen(req).read()).decode())
+"""
+        logger.warning(
+            "IP address is in unsupported region. Copy and run the following "
+            "Python command on a device in a supported region:\n"
+        )
+        rich.print(f'python -c "{script}"\n')
+        rich.print("Paste the base64-encoded response below (empty line to finish):")
+
+        lines: list[str] = []
+        while True:
+            line = input()
+            if not line.strip():
+                break
+            lines.append(line.strip())
+
+        b64_input = "".join(lines)
+        if not b64_input:
+            raise ModuleAuthError("No response provided for remote login")
+
+        try:
+            raw_bytes = base64.b64decode(b64_input)
+            decoded: dict[str, Any] = msgspec.json.decode(self._kc1_decrypt(raw_bytes))
+        except Exception as e:
+            raise ModuleAuthError(f"Failed to decode remote login response: {e}") from e
+
+        return decoded
 
     async def renew_session(self) -> None:
         """Renew the current session.
