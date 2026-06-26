@@ -4,11 +4,9 @@ This module provides an async KKBOX API client using aiohttp,
 handling authentication, content retrieval, and DRM decryption.
 """
 
-import base64
 import logging
 import re
 from pathlib import Path
-from random import randrange
 from time import time
 from typing import Any
 
@@ -17,7 +15,6 @@ import msgspec
 import rich
 from anyio.to_thread import run_sync
 from Cryptodome.Cipher import ARC4
-from Cryptodome.Hash import MD5
 from mutagen.flac import FLAC
 from tenacity import (
     RetryError,
@@ -30,6 +27,16 @@ from tenacity import (
 from haberlea.utils.exceptions import ModuleAPIError, ModuleAuthError, ModuleError
 from haberlea.utils.models import TemporarySettingsController
 from haberlea.utils.utils import DownloadConfig, create_aiohttp_session, download_file
+
+from .protocol import (
+    REGION_BLOCKED_STATUS,
+    api_url,
+    build_request_params,
+    extract_session_data,
+    generate_kkid,
+    hash_password,
+    kc1_decrypt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +135,7 @@ class KkboxAPI:
 
         self.kc1_key = kc1_key.encode("ascii")
         self.secret_key = secret_key.encode("ascii")
-        self.kkid = kkid or f"{randrange(16**32):032X}"
+        self.kkid = kkid or generate_kkid()
         self.session = create_aiohttp_session()
 
         self._headers = {"user-agent": "okhttp/3.14.9"}
@@ -136,49 +143,10 @@ class KkboxAPI:
         self.lic_content_key: bytes | None = None
         self.available_qualities: list[str] = []
 
-        self._base_params: dict[str, str] = {
-            "enc": "u",
-            "ver": "06120082",
-            "os": "android",
-            "osver": "13",
-            "lang": "en",
-            "ui_lang": "en",
-            "dist": "0021",
-            "dist2": "0021",
-            "resolution": "411x841",
-            "of": "j",
-            "oenc": "kc1",
-        }
-
     async def close(self) -> None:
         """Close the aiohttp session."""
         if not self.session.closed:
             await self.session.close()
-
-    def _kc1_decrypt(self, data: bytes) -> str:
-        """Decrypt KC1 encrypted data.
-
-        Args:
-            data: Encrypted bytes.
-
-        Returns:
-            Decrypted string.
-        """
-        cipher = ARC4.new(self.kc1_key)
-        return cipher.decrypt(data).decode("utf-8")
-
-    def _create_secret(self) -> str:
-        """Create API request secret hash.
-
-        Returns:
-            MD5 hash string for API authentication.
-        """
-        timestamp = int(time())
-        md5 = MD5.new()
-        md5.update(self._base_params["ver"].encode("ascii"))
-        md5.update(str(timestamp).encode("ascii"))
-        md5.update(self.secret_key)
-        return md5.hexdigest()
 
     async def _api_call(
         self,
@@ -204,15 +172,12 @@ class KkboxAPI:
         if params is None:
             params = {}
 
-        timestamp = int(time())
-        request_params = {**self._base_params, **params}
-        request_params["secret"] = self._create_secret()
-        request_params["timestamp"] = str(timestamp)
+        request_params = {**build_request_params(self.secret_key), **params}
 
         if self.sid:
             request_params["sid"] = self.sid
 
-        url = f"https://api-{host}.kkbox.com.tw/{path}"
+        url = api_url(host, path)
 
         try:
             if payload is not None:
@@ -228,7 +193,7 @@ class KkboxAPI:
                         if not response.content:
                             return None
                         content = await response.read()
-                        return msgspec.json.decode(self._kc1_decrypt(content))
+                        return msgspec.json.decode(kc1_decrypt(self.kc1_key, content))
                 else:
                     # Use form data for login and other endpoints
                     async with self.session.post(
@@ -240,7 +205,7 @@ class KkboxAPI:
                         if not response.content:
                             return None
                         content = await response.read()
-                        return msgspec.json.decode(self._kc1_decrypt(content))
+                        return msgspec.json.decode(kc1_decrypt(self.kc1_key, content))
             else:
                 # GET request
                 async with self.session.get(
@@ -251,7 +216,7 @@ class KkboxAPI:
                     if not response.content:
                         return None
                     content = await response.read()
-                    return msgspec.json.decode(self._kc1_decrypt(content))
+                    return msgspec.json.decode(kc1_decrypt(self.kc1_key, content))
 
         except Exception as e:
             raise ModuleAPIError(
@@ -286,21 +251,6 @@ class KkboxAPI:
         self.available_qualities = ["128k", "192k", "320k"]
         if resp.get("high_quality"):
             self.available_qualities.extend(["hifi", "hires"])
-
-    def _extract_session_data(self, resp: dict[str, Any]) -> dict[str, Any]:
-        """Extract minimal session data needed for restoration.
-
-        Args:
-            resp: Full login response dictionary.
-
-        Returns:
-            Dictionary containing only the fields needed for session restoration.
-        """
-        return {
-            "sid": resp["sid"],
-            "lic_content_key": resp["lic_content_key"],
-            "high_quality": resp.get("high_quality", 0),
-        }
 
     def restore_session(self) -> bool:
         """Restore session from saved data without verification.
@@ -351,9 +301,7 @@ class KkboxAPI:
             self.tsc.set("login_response", None)
 
         # Perform fresh login
-        md5 = MD5.new()
-        md5.update(password.encode("utf-8"))
-        pswd_hash = md5.hexdigest()
+        pswd_hash = hash_password(password)
 
         resp = await self._api_call(
             "login",
@@ -370,7 +318,7 @@ class KkboxAPI:
             raise ModuleAuthError(module_name="kkbox")
 
         status = resp.get("status")
-        if status == -4:
+        if status == REGION_BLOCKED_STATUS:
             resp = await self._remote_login_fallback(email, pswd_hash)
             status = resp.get("status")
 
@@ -378,72 +326,63 @@ class KkboxAPI:
             raise ModuleAuthError(module_name="kkbox")
 
         # Save minimal session data and apply
-        self.tsc.set("login_response", self._extract_session_data(resp))
+        self.tsc.set("login_response", extract_session_data(resp))
         self._apply_session(resp)
 
     async def _remote_login_fallback(
         self, email: str, pswd_hash: str
     ) -> dict[str, Any]:
-        """Prompt user to perform login from a supported-region device.
+        """Recover login via a device in a supported region.
 
-        When the local IP is blocked (status -4), generates a one-line Python
-        command that the user can run on a device in a supported region,
-        then pastes the base64-encoded raw response back. The response is
-        decoded and KC1-decrypted locally.
+        When the host IP is region blocked (status -4), this prints a
+        ready-to-run ``uvx`` command (with all credentials embedded as
+        arguments). The user runs it on a device in a supported region; the
+        standalone ``haberlea-kkbox`` tool performs the full login and KC1
+        decryption, verifies success, then prints a single short JSON line.
+        Pasting that short JSON back avoids the terminal truncation that the
+        full base64 response would cause.
 
         Args:
             email: User email address.
             pswd_hash: MD5-hashed password.
 
         Returns:
-            Decoded login response dictionary.
+            A login response dict with ``status`` set to success and the
+            ``sid``/``lic_content_key``/``high_quality`` fields populated from
+            the remote tool's output.
 
         Raises:
-            ModuleAuthError: If the response cannot be decoded.
+            ModuleAuthError: If no or invalid session JSON is provided.
         """
-        script = f"""
-import time, hashlib, urllib.request, urllib.parse, base64
-t = str(int(time.time()))
-sec = hashlib.md5(
-    b'06120082' + t.encode() + b'{self.secret_key.decode("ascii")}'
-).hexdigest()
-url = 'https://api-login.kkbox.com.tw/login.php?' + urllib.parse.urlencode({{
-    'enc': 'u', 'ver': '06120082', 'os': 'android', 'osver': '13',
-    'lang': 'en', 'ui_lang': 'en', 'dist': '0021', 'dist2': '0021',
-    'resolution': '411x841', 'of': 'j', 'oenc': 'kc1', 'secret': sec, 'timestamp': t
-}})
-data = urllib.parse.urlencode({{
-    'uid': '{email}', 'passwd': '{pswd_hash}', 
-    'kkid': '{self.kkid}', 'registration_id': ''
-}}).encode()
-req = urllib.request.Request(url, data=data, headers={{'user-agent': 'okhttp/3.14.9'}})
-print(base64.b64encode(urllib.request.urlopen(req).read()).decode())
-"""
-        logger.warning(
-            "IP address is in unsupported region. Copy and run the following "
-            "Python command on a device in a supported region:\n"
+        command = (
+            'uvx --from "git+https://github.com/KyokoMiki/haberlea-kkbox" '
+            f'remote-login "{email}" "{pswd_hash}" "{self.kkid}" '
+            f'"{self.kc1_key.decode("ascii")}" "{self.secret_key.decode("ascii")}"'
         )
-        rich.print(f'python -c "{script}"\n')
-        rich.print("Paste the base64-encoded response below (empty line to finish):")
-
-        lines: list[str] = []
-        while True:
-            line = input()
-            if not line.strip():
-                break
-            lines.append(line.strip())
-
-        b64_input = "".join(lines)
-        if not b64_input:
-            raise ModuleAuthError("No response provided for remote login")
+        logger.warning(
+            "IP address is in an unsupported region. Run the following command "
+            "on a device in a supported region:\n"
+        )
+        print(f"{command}\n")
+        rich.print("Paste the JSON line it prints below and press Enter:")
+        raw = input().strip()
+        if not raw:
+            raise ModuleAuthError("No session data provided for remote login")
 
         try:
-            raw_bytes = base64.b64decode(b64_input)
-            decoded: dict[str, Any] = msgspec.json.decode(self._kc1_decrypt(raw_bytes))
-        except Exception as e:
-            raise ModuleAuthError(f"Failed to decode remote login response: {e}") from e
+            session: dict[str, Any] = msgspec.json.decode(raw.encode("utf-8"))
+        except msgspec.DecodeError as e:
+            raise ModuleAuthError(f"Invalid session JSON for remote login: {e}") from e
 
-        return decoded
+        try:
+            return {
+                "status": 2,
+                "sid": session["sid"],
+                "lic_content_key": session["lic_content_key"],
+                "high_quality": session.get("high_quality", 0),
+            }
+        except KeyError as e:
+            raise ModuleAuthError(f"Session JSON missing required field: {e}") from e
 
     async def renew_session(self) -> None:
         """Renew the current session.
