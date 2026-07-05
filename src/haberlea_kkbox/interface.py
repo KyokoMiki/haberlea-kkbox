@@ -232,6 +232,7 @@ class ModuleInterface(ModuleBase):
             kc1_key=settings["kc1_key"],
             secret_key=settings["secret_key"],
             tsc=tsc,
+            auth_prompter=module_controller.auth_prompter,
             kkid=kkid,
         )
 

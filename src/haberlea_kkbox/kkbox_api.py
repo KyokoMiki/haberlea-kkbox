@@ -12,7 +12,6 @@ from typing import Any
 
 import anyio
 import msgspec
-import rich
 from anyio.to_thread import run_sync
 from Cryptodome.Cipher import ARC4
 from mutagen.flac import FLAC
@@ -24,6 +23,7 @@ from tenacity import (
     wait_fixed,
 )
 
+from haberlea.utils.auth_prompter import AuthPrompter
 from haberlea.utils.exceptions import ModuleAPIError, ModuleAuthError, ModuleError
 from haberlea.utils.models import TemporarySettingsController
 from haberlea.utils.utils import DownloadConfig, create_aiohttp_session, download_file
@@ -42,6 +42,15 @@ logger = logging.getLogger(__name__)
 
 # Maximum number of retries for get_ticket
 MAX_RETRIES = 5
+
+_REMOTE_LOGIN_PROMPT = (
+    "KKBOX login: this IP address is in an unsupported region.\n"
+    "1. Run the following command on a device in a supported region:\n"
+    "\n"
+    "{command}\n"
+    "\n"
+    "2. Paste the JSON line it prints here."
+)
 
 
 class SessionRetryableError(ModuleError):
@@ -94,6 +103,7 @@ class KkboxAPI:
         kc1_key: KC1 decryption key (32-character hex string).
         secret_key: API secret key (32-character hex string).
         tsc: Temporary settings controller for session persistence.
+        auth_prompter: Channel for interactive prompts during login.
         kkid: Device identifier. Generated if not provided.
     """
 
@@ -102,6 +112,7 @@ class KkboxAPI:
         kc1_key: str,
         secret_key: str,
         tsc: TemporarySettingsController,
+        auth_prompter: AuthPrompter,
         kkid: str | None = None,
     ) -> None:
         """Initialize the KKBOX API client.
@@ -110,12 +121,14 @@ class KkboxAPI:
             kc1_key: KC1 decryption key (32-character hex string).
             secret_key: API secret key (32-character hex string).
             tsc: Temporary settings controller for session persistence.
+            auth_prompter: Channel for interactive prompts during login.
             kkid: Device identifier. Generated if not provided.
 
         Raises:
             ModuleAPIError: If kc1_key or secret_key is invalid.
         """
         self.tsc = tsc
+        self.auth_prompter = auth_prompter
         key_pattern = re.compile("[0-9a-f]{32}")
 
         if not key_pattern.fullmatch(kc1_key):
@@ -334,13 +347,13 @@ class KkboxAPI:
     ) -> dict[str, Any]:
         """Recover login via a device in a supported region.
 
-        When the host IP is region blocked (status -4), this prints a
+        When the host IP is region blocked (status -4), this shows a
         ready-to-run ``uvx`` command (with all credentials embedded as
-        arguments). The user runs it on a device in a supported region; the
-        standalone ``haberlea-kkbox`` tool performs the full login and KC1
-        decryption, verifies success, then prints a single short JSON line.
-        Pasting that short JSON back avoids the terminal truncation that the
-        full base64 response would cause.
+        arguments) through the auth prompter. The user runs it on a device in
+        a supported region; the standalone ``haberlea-kkbox`` tool performs
+        the full login and KC1 decryption, verifies success, then prints a
+        single short JSON line. Pasting that short JSON back avoids the
+        terminal truncation that the full base64 response would cause.
 
         Args:
             email: User email address.
@@ -359,18 +372,14 @@ class KkboxAPI:
             f'remote-login "{email}" "{pswd_hash}" "{self.kkid}" '
             f'"{self.kc1_key.decode("ascii")}" "{self.secret_key.decode("ascii")}"'
         )
-        logger.warning(
-            "IP address is in an unsupported region. Run the following command "
-            "on a device in a supported region:\n"
+        raw = await self.auth_prompter.request_input(
+            _REMOTE_LOGIN_PROMPT.format(command=command)
         )
-        print(f"{command}\n")
-        rich.print("Paste the JSON line it prints below and press Enter:")
-        raw = input().strip()
         if not raw:
             raise ModuleAuthError("No session data provided for remote login")
 
         try:
-            session: dict[str, Any] = msgspec.json.decode(raw.encode("utf-8"))
+            session: dict[str, Any] = msgspec.json.decode(raw)
         except msgspec.DecodeError as e:
             raise ModuleAuthError(f"Invalid session JSON for remote login: {e}") from e
 

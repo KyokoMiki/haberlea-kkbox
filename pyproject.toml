@@ -12,7 +12,6 @@ dependencies = [
     "msgspec>=0.20.0",
     "mutagen>=1.47.0",
     "pycryptodomex>=3.23.0",
-    "rich>=14.2.0",
     "tenacity>=9.0.0",
 ]
 
