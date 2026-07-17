@@ -10,6 +10,7 @@ from pathlib import Path
 from time import time
 from typing import Any
 
+import aiohttp
 import anyio
 import msgspec
 from anyio.to_thread import run_sync
@@ -20,7 +21,7 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_fixed,
+    wait_exponential,
 )
 
 from haberlea.utils.auth_prompter import AuthPrompter
@@ -41,7 +42,7 @@ from .protocol import (
 logger = logging.getLogger(__name__)
 
 # Maximum number of retries for get_ticket
-MAX_RETRIES = 5
+MAX_RETRIES = 10
 
 _REMOTE_LOGIN_PROMPT = (
     "KKBOX login: this IP address is in an unsupported region.\n"
@@ -192,45 +193,19 @@ class KkboxAPI:
 
         url = api_url(host, path)
 
-        try:
-            if payload is not None:
-                # For ticket host, use JSON encoding; for others, use form data
-                if host == "ticket":
-                    payload_data = msgspec.json.encode(payload)
-                    async with self.session.post(
-                        url,
-                        params=request_params,
-                        data=payload_data,
-                        headers=self._headers,
-                    ) as response:
-                        if not response.content:
-                            return None
-                        content = await response.read()
-                        return msgspec.json.decode(kc1_decrypt(self.kc1_key, content))
-                else:
-                    # Use form data for login and other endpoints
-                    async with self.session.post(
-                        url,
-                        params=request_params,
-                        data=payload,
-                        headers=self._headers,
-                    ) as response:
-                        if not response.content:
-                            return None
-                        content = await response.read()
-                        return msgspec.json.decode(kc1_decrypt(self.kc1_key, content))
-            else:
-                # GET request
-                async with self.session.get(
-                    url,
-                    params=request_params,
-                    headers=self._headers,
-                ) as response:
-                    if not response.content:
-                        return None
-                    content = await response.read()
-                    return msgspec.json.decode(kc1_decrypt(self.kc1_key, content))
+        if payload is not None and host == "ticket":
+            # For ticket host, use JSON encoding; for others, use form data
+            method = "POST"
+            data: bytes | dict[str, Any] | None = msgspec.json.encode(payload)
+        elif payload is not None:
+            method = "POST"
+            data = payload
+        else:
+            method = "GET"
+            data = None
 
+        try:
+            return await self._request_and_decode(method, url, request_params, data)
         except Exception as e:
             raise ModuleAPIError(
                 error_code=500,
@@ -238,6 +213,49 @@ class KkboxAPI:
                 api_endpoint=path,
                 module_name="kkbox",
             ) from e
+
+    @retry(
+        retry=retry_if_exception_type((aiohttp.ClientConnectionError, TimeoutError)),
+        stop=stop_after_attempt(MAX_RETRIES),
+        wait=wait_exponential(multiplier=0.5, max=10),
+        reraise=True,
+    )
+    async def _request_and_decode(
+        self,
+        method: str,
+        url: str,
+        request_params: dict[str, Any],
+        data: bytes | dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Perform the HTTP request and decode the KC1-encrypted response.
+
+        Transient network failures (connection errors, timeouts) are
+        retried with exponential backoff.
+
+        Args:
+            method: HTTP method ("GET" or "POST").
+            url: Full request URL.
+            request_params: Query parameters.
+            data: POST body (JSON bytes or form dict), or None for GET.
+
+        Returns:
+            Decoded JSON response or None if empty.
+
+        Raises:
+            aiohttp.ClientError: If the request fails after all retries.
+            TimeoutError: If the request times out after all retries.
+        """
+        async with self.session.request(
+            method,
+            url,
+            params=request_params,
+            data=data,
+            headers=self._headers,
+        ) as response:
+            if not response.content:
+                return None
+            content = await response.read()
+            return msgspec.json.decode(kc1_decrypt(self.kc1_key, content))
 
     def _apply_session(self, resp: dict[str, Any]) -> None:
         """Apply session data from login response.
@@ -512,7 +530,7 @@ class KkboxAPI:
     @retry(
         retry=retry_if_exception_type(SessionRetryableError),
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_fixed(0),
+        wait=wait_exponential(multiplier=0.5, max=10),
         reraise=True,
     )
     async def get_album_more(self, raw_id: int) -> dict[str, Any]:
@@ -681,7 +699,7 @@ class KkboxAPI:
     @retry(
         retry=retry_if_exception_type(SessionRetryableError),
         stop=stop_after_attempt(MAX_RETRIES),
-        wait=wait_fixed(0),
+        wait=wait_exponential(multiplier=0.5, max=10),
         reraise=True,
     )
     async def _get_ticket_with_retry(
