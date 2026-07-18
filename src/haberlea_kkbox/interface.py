@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from haberlea.plugins.base import ModuleBase
+from haberlea.utils.exceptions import ModuleAuthError
 from haberlea.utils.models import (
     AlbumInfo,
     ArtistInfo,
@@ -361,10 +362,16 @@ class ModuleInterface(ModuleBase):
         if quality not in available_qualities and available_qualities:
             quality = available_qualities[-1]
 
-        # Check subscription
+        # Check subscription, renewing the session once in case the
+        # cached session data has stale subscription information
         error = None
         if quality not in self.api.available_qualities:
-            error = "Quality not available by your subscription"
+            try:
+                await self.api.renew_session()
+            except ModuleAuthError:
+                logger.warning("KKBOX: session renewal failed during quality check")
+            if quality not in self.api.available_qualities:
+                error = "Quality not available by your subscription"
 
         # Map quality to codec
         codec_map: dict[str, CodecEnum] = {
